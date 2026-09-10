@@ -30,7 +30,7 @@ canvas.style.cursor            = 'crosshair';
 const VIRTUAL_W    = 320;
 const VIRTUAL_H    = 240;
 const FOCAL_LENGTH = 600;
-const Z_OFFSET     = 5;
+const Z_OFFSET     = 500;
 const MODEL_SCALE  = 80;
 
 const LIGHT: [number, number, number] = normaliseV3(0.4, 0.7, -0.6);
