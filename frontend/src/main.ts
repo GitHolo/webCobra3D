@@ -133,17 +133,24 @@ function rotateX(x: number, y: number, z: number, a: number): [number, number, n
  *   3. Scale up to real canvas pixels
  */
 function projectSnapped(
-  x: number, y: number, z: number,
-  scaleX: number, scaleY: number
+  x: number, y: number, z: number
 ): [number, number] {
   const depth = z + Z_OFFSET;
-  const f     = depth > 0.001 ? FOCAL_LENGTH / depth : FOCAL_LENGTH / 0.001;
+  const f = depth > 0.001 ? FOCAL_LENGTH / depth : FOCAL_LENGTH / 0.001;
 
-  const vx = (VIRTUAL_W / 2) + x * f * MODEL_SCALE / (canvas.width  / VIRTUAL_W);
-  const vy = (VIRTUAL_H / 2) - y * f * MODEL_SCALE / (canvas.height / VIRTUAL_H);
+  // 1. Calculate the exact, smooth screen coordinates directly onto your canvas
+  const rawX = (canvas.width / 2) + (x * f * MODEL_SCALE);
+  const rawY = (canvas.height / 2) - (y * f * MODEL_SCALE);
 
-  // ← PS1 snap: quantise to the 320×240 grid
-  return [Math.round(vx) * scaleX, Math.round(vy) * scaleY];
+  // 2. The Jitter Factor (Higher number = crunchier PS1 wobble)
+  // 1 = perfectly smooth, 3-5 = authentic retro snap
+  const JITTER = 3;
+
+  // 3. Snap to the artificial pixel grid
+  const snappedX = Math.round(rawX / JITTER) * JITTER;
+  const snappedY = Math.round(rawY / JITTER) * JITTER;
+
+  return [snappedX, snappedY];
 }
 
 // ---------------------------------------------------------------------------
@@ -217,7 +224,7 @@ function tick(_ts: DOMHighResTimeStamp): void {
         ...crossV3(x1-x0, y1-y0, z1-z0, x2-x0, y2-y0, z2-z0)
       );
       const diffuse    = Math.max(0, dotV3(nx, ny, nz, LIGHT[0], LIGHT[1], LIGHT[2]));
-      const brightness = 0.15 + 0.85 * diffuse;
+      const brightness = 0.55 + 0.45 * diffuse;
 
       const entry      = faceBuffer[fi++];
       entry.faceOffset = i;
@@ -257,7 +264,7 @@ function tick(_ts: DOMHighResTimeStamp): void {
       const v = Math.round(brightness * 255);
       ctx!.fillStyle   = `rgb(${v},${v},${v})`;
       ctx!.strokeStyle = `rgb(${v},${v},${v})`;
-      ctx!.lineWidth   = 0.5;
+      ctx!.lineWidth   = 1;
 
       ctx!.beginPath();
       ctx!.moveTo(sx0, sy0);
