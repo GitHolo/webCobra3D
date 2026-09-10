@@ -31,7 +31,7 @@ const FOCAL_LENGTH = 600;
 const Z_OFFSET     = 500;
 const MODEL_SCALE  = 80;
 /** Snap granularity in real canvas pixels. Higher = chunkier PS1 wobble. */
-const JITTER       = 3;
+const JITTER       = 5;
 
 const LIGHT: [number, number, number] = normaliseV3(0.4, 0.7, -0.6);
 
@@ -266,10 +266,13 @@ function tick(_ts: DOMHighResTimeStamp): void {
       const [sx1, sy1] = projectSnapped(rx1, ry1, rz1);
       const [sx2, sy2] = projectSnapped(rx2, ry2, rz2);
 
-      const v = Math.round(brightness * 255);
-      ctx!.fillStyle   = `rgb(${v},${v},${v})`;
-      ctx!.strokeStyle = `rgb(${v},${v},${v})`;
-      ctx!.lineWidth   = 0.5;
+      const r = Math.round(brightness * 252);
+      const g = Math.round(brightness * 186);
+      const b = Math.round(brightness * 3);
+
+      ctx!.fillStyle   = `rgb(${r},${g},${b})`;
+      ctx!.strokeStyle = `rgb(${r},${g},${b})`;
+      ctx!.lineWidth    = 0.5;
 
       ctx!.beginPath();
       ctx!.moveTo(sx0, sy0);
