@@ -1,4 +1,4 @@
-﻿import { ObjLoader, type ObjData } from './ObjLoader';
+import { ObjLoader, type ObjData } from './ObjLoader';
 
 // ---------------------------------------------------------------------------
 // Canvas setup
@@ -27,11 +27,11 @@ canvas.style.cursor            = 'crosshair';
 // Rendering constants
 // ---------------------------------------------------------------------------
 
-const VIRTUAL_W    = 320;
-const VIRTUAL_H    = 240;
 const FOCAL_LENGTH = 600;
-const Z_OFFSET     = 500;
+const Z_OFFSET     = 5;
 const MODEL_SCALE  = 80;
+/** Snap granularity in real canvas pixels. Higher = chunkier PS1 wobble. */
+const JITTER       = 3;
 
 const LIGHT: [number, number, number] = normaliseV3(0.4, 0.7, -0.6);
 
@@ -128,29 +128,23 @@ function rotateX(x: number, y: number, z: number, a: number): [number, number, n
  * Projects a 3D point to 2D with PS1-style vertex snapping.
  *
  * Pipeline:
- *   1. Perspective divide into virtual 320×240 space
- *   2. Math.round() — snaps to low-res grid, causing PS1 jitter
- *   3. Scale up to real canvas pixels
+ *   1. Perspective divide — FOCAL_LENGTH / (z + Z_OFFSET)
+ *   2. Centre onto canvas.width/2, canvas.height/2
+ *   3. Snap to JITTER-pixel grid with Math.round(val/JITTER)*JITTER
  */
-function projectSnapped(
-  x: number, y: number, z: number
-): [number, number] {
+function projectSnapped(x: number, y: number, z: number): [number, number] {
   const depth = z + Z_OFFSET;
-  const f = depth > 0.001 ? FOCAL_LENGTH / depth : FOCAL_LENGTH / 0.001;
+  const f     = depth > 0.001 ? FOCAL_LENGTH / depth : FOCAL_LENGTH / 0.001;
 
-  // 1. Calculate the exact, smooth screen coordinates directly onto your canvas
-  const rawX = (canvas.width / 2) + (x * f * MODEL_SCALE);
-  const rawY = (canvas.height / 2) - (y * f * MODEL_SCALE);
+  // Exact, smooth canvas-space coordinates
+  const rawX = canvas.width  / 2 + x * f * MODEL_SCALE;
+  const rawY = canvas.height / 2 - y * f * MODEL_SCALE;
 
-  // 2. The Jitter Factor (Higher number = crunchier PS1 wobble)
-  // 1 = perfectly smooth, 3-5 = authentic retro snap
-  const JITTER = 3;
-
-  // 3. Snap to the artificial pixel grid
-  const snappedX = Math.round(rawX / JITTER) * JITTER;
-  const snappedY = Math.round(rawY / JITTER) * JITTER;
-
-  return [snappedX, snappedY];
+  // Snap to JITTER-pixel grid → the PS1 wobble
+  return [
+    Math.round(rawX / JITTER) * JITTER,
+    Math.round(rawY / JITTER) * JITTER,
+  ];
 }
 
 // ---------------------------------------------------------------------------
