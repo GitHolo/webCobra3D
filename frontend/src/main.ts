@@ -51,7 +51,7 @@ let lastMouseY       = 0;
 
 const ROT_SENSITIVITY  = 0.005;
 const PAN_SENSITIVITY  = 0.015;
-const ZOOM_SENSITIVITY = 30;      // Z_OFFSET units per normalised wheel delta
+const ZOOM_SENSITIVITY = 50;    // Z_OFFSET units per normalised wheel delta (~100 per notch)
 
 canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 
@@ -96,7 +96,7 @@ canvas.addEventListener('wheel', (e) => {
   e.preventDefault();
   // deltaY > 0 → scroll down → zoom out (object further away → increase Z_OFFSET)
   Z_OFFSET += e.deltaY * ZOOM_SENSITIVITY * 0.01;
-  Z_OFFSET  = Math.max(50, Math.min(5000, Z_OFFSET));
+  Z_OFFSET  = Math.max(50, Math.min(500_000, Z_OFFSET));
 }, { passive: false });
 
 // ---------------------------------------------------------------------------
@@ -219,7 +219,7 @@ class FlightDynamics {
     this.velZ += fz * this.thrust * dt;
 
     // Simple aerodynamic drag
-    const drag = 0.98;
+    const drag = 0.995;
     this.velX *= drag;
     this.velY *= drag;
     this.velZ *= drag;
@@ -232,11 +232,74 @@ class FlightDynamics {
 }
 
 const flight = new FlightDynamics();
-flight.thrust    = 0.5;
+flight.thrust    = 50;   // 100× original — supersonic acceleration
 flight.pitchRate = 0.0;
 
 // ---------------------------------------------------------------------------
-// Procedural terrain generator with frustum culling
+// Keyboard input state
+// ---------------------------------------------------------------------------
+
+const keys: Record<string, boolean> = {};
+
+window.addEventListener('keydown', (e) => {
+  keys[e.code] = true;
+  // Prevent arrow keys / space from scrolling the page
+  if (['Space','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.code)) {
+    e.preventDefault();
+  }
+});
+window.addEventListener('keyup', (e) => { keys[e.code] = false; });
+
+/**
+ * Constants for how fast controls change angular rates and throttle.
+ * PITCH/ROLL/YAW_ACCEL: how fast rates ramp up while a key is held (rad/s per s).
+ * RATE_DECAY:           natural decay applied when no key is pressed (per frame factor).
+ * THROTTLE_STEP:        thrust units added/removed per second of key hold.
+ */
+const PITCH_ACCEL   = 0.8;    // rad/s²
+const ROLL_ACCEL    = 1.2;    // rad/s²
+const YAW_ACCEL     = 0.5;    // rad/s²
+const RATE_DECAY    = 0.88;   // bleed rate so releasing a key smoothly damps rotation
+const THROTTLE_STEP = 30;     // thrust units / s
+const THROTTLE_MAX  = 500;
+
+/** Apply keyboard state to FlightDynamics rates and throttle before physics step. */
+function applyKeyInputs(dt: number): void {
+  // --- Pitch: W = nose up (negative pitch rate), S = nose down ---
+  if (keys['KeyW']) {
+    flight.pitchRate -= PITCH_ACCEL * dt;
+  } else if (keys['KeyS']) {
+    flight.pitchRate += PITCH_ACCEL * dt;
+  } else {
+    flight.pitchRate *= RATE_DECAY;
+  }
+
+  // --- Roll: A = roll left, D = roll right ---
+  if (keys['KeyA']) {
+    flight.rollRate -= ROLL_ACCEL * dt;
+  } else if (keys['KeyD']) {
+    flight.rollRate += ROLL_ACCEL * dt;
+  } else {
+    flight.rollRate *= RATE_DECAY;
+  }
+
+  // --- Yaw: Q = yaw left, E = yaw right ---
+  if (keys['KeyQ']) {
+    flight.yawRate -= YAW_ACCEL * dt;
+  } else if (keys['KeyE']) {
+    flight.yawRate += YAW_ACCEL * dt;
+  } else {
+    flight.yawRate *= RATE_DECAY;
+  }
+
+  // --- Throttle: Shift = increase, Ctrl = decrease ---
+  if (keys['ShiftLeft'] || keys['ShiftRight']) {
+    flight.thrust = Math.min(THROTTLE_MAX, flight.thrust + THROTTLE_STEP * dt);
+  } else if (keys['ControlLeft'] || keys['ControlRight']) {
+    flight.thrust = Math.max(0, flight.thrust - THROTTLE_STEP * dt);
+  }
+}
+
 // ---------------------------------------------------------------------------
 
 /**
@@ -248,15 +311,16 @@ flight.pitchRate = 0.0;
  * the same screen edge the triangle is discarded (conservative, no clipping).
  */
 
-const TERRAIN_GRID_HALF = 12;    // cells in each direction from camera
-const TERRAIN_CELL_SIZE = 3;     // world units per cell
+const TERRAIN_GRID_HALF = 80;      // cells in each direction — 80×80 total
+const TERRAIN_CELL_SIZE = 300;     // 100× wider cells — massive world scale
 
 function terrainHeight(wx: number, wz: number): number {
+  // Wide rolling hills — amplitudes kept small relative to cell size
   return (
-    Math.sin(wx * 0.18) * 1.4 +
-    Math.sin(wz * 0.13) * 1.2 +
-    Math.sin((wx + wz) * 0.09) * 0.8 +
-    Math.sin(wx * 0.35 - wz * 0.22) * 0.4
+    Math.sin(wx * 0.00180) * 250 +
+    Math.sin(wz * 0.00130) * 200 +
+    Math.sin((wx + wz) * 0.00090) * 120 +
+    Math.sin(wx * 0.00350 - wz * 0.00220) * 60
   );
 }
 
@@ -325,12 +389,16 @@ function frustumCull(
  */
 function pushTerrainFaces(startIdx: number, camWX: number, camWZ: number): number {
   let idx = startIdx;
-  const groundY = -2.5;   // terrain sits below the jet's origin
+  const groundY = -5000;   // high-altitude: terrain floor 5000 world units below jet
+
+  // Jet's world-space Y — terrain is translated relative to this so the
+  // camera always orbits around the jet, not the world origin.
+  const camWY = flight.posY;
 
   function toView(wx: number, wy: number, wz: number): [number, number, number] {
-    // Translate to camera-local space and normalise to model units
+    // Translate so the jet is at view-space origin, then normalise to model units
     const lx = (wx - camWX) / MODEL_SCALE;
-    const ly = wy           / MODEL_SCALE;
+    const ly = (wy - camWY) / MODEL_SCALE;   // ← subtract jet Y
     const lz = (wz - camWZ) / MODEL_SCALE;
     let v = rotateY(lx, ly, lz, rotAngleY);
     v     = rotateX(v[0], v[1], v[2], rotAngleX);
@@ -361,7 +429,7 @@ function pushTerrainFaces(startIdx: number, camWX: number, camWZ: number): numbe
       if (idx < MAX_FACES && frustumCull(ax, ay, az, bx, by, bz, cx, cy, cz)) {
         const [cnx, cny, cnz] = crossV3(bx-ax, by-ay, bz-az, cx-ax, cy-ay, cz-az);
         const [nx, ny, nz]   = normaliseV3(cnx, cny, cnz);
-        const br = 0.35 + 0.65 * Math.max(0, dotV3(nx, ny, nz, LIGHT[0], LIGHT[1], LIGHT[2]));
+        const br = 0.45 + 0.55 * Math.max(0, dotV3(nx, ny, nz, LIGHT[0], LIGHT[1], LIGHT[2]));
         const e  = facePool[idx++];
         e.x0=ax; e.y0=ay; e.z0=az; e.x1=bx; e.y1=by; e.z1=bz; e.x2=cx; e.y2=cy; e.z2=cz;
         e.avgZ = (az+bz+cz)/3; e.brightness = br; e.kind = 1;
@@ -371,7 +439,7 @@ function pushTerrainFaces(startIdx: number, camWX: number, camWZ: number): numbe
       if (idx < MAX_FACES && frustumCull(bx, by, bz, dx, dy, dz, cx, cy, cz)) {
         const [cnx, cny, cnz] = crossV3(dx-bx, dy-by, dz-bz, cx-bx, cy-by, cz-bz);
         const [nx, ny, nz]   = normaliseV3(cnx, cny, cnz);
-        const br = 0.35 + 0.65 * Math.max(0, dotV3(nx, ny, nz, LIGHT[0], LIGHT[1], LIGHT[2]));
+        const br = 0.45 + 0.55 * Math.max(0, dotV3(nx, ny, nz, LIGHT[0], LIGHT[1], LIGHT[2]));
         const e  = facePool[idx++];
         e.x0=bx; e.y0=by; e.z0=bz; e.x1=dx; e.y1=dy; e.z1=dz; e.x2=cx; e.y2=cy; e.z2=cz;
         e.avgZ = (bz+dz+cz)/3; e.brightness = br; e.kind = 1;
@@ -406,7 +474,8 @@ function tick(ts: DOMHighResTimeStamp): void {
   const dt = Math.min((ts - lastTs) / 1000, 0.05);
   lastTs = ts;
 
-  // Update flight physics
+  // Apply keyboard controls, then update flight physics
+  applyKeyInputs(dt);
   flight.update(dt);
 
   // Camera tracks jet world position so terrain scrolls beneath it
@@ -435,9 +504,16 @@ function tick(ts: DOMHighResTimeStamp): void {
       const i1 = indices[i + 1] * 3;
       const i2 = indices[i + 2] * 3;
 
-      let [x0, y0, z0] = rotateX(...rotateY(vertices[i0], vertices[i0+1], vertices[i0+2], rotAngleY), rotAngleX);
-      let [x1, y1, z1] = rotateX(...rotateY(vertices[i1], vertices[i1+1], vertices[i1+2], rotAngleY), rotAngleX);
-      let [x2, y2, z2] = rotateX(...rotateY(vertices[i2], vertices[i2+1], vertices[i2+2], rotAngleY), rotAngleX);
+      // Step 1 — apply jet's own flight orientation (body → world)
+      //   yaw first, then pitch, then roll  (standard aerospace convention)
+      let [bx0, by0, bz0] = rotateEuler(vertices[i0], vertices[i0+1], vertices[i0+2], flight.yaw, flight.pitch, flight.roll);
+      let [bx1, by1, bz1] = rotateEuler(vertices[i1], vertices[i1+1], vertices[i1+2], flight.yaw, flight.pitch, flight.roll);
+      let [bx2, by2, bz2] = rotateEuler(vertices[i2], vertices[i2+1], vertices[i2+2], flight.yaw, flight.pitch, flight.roll);
+
+      // Step 2 — apply camera orbit (mouse rotation) on top
+      let [x0, y0, z0] = rotateX(...rotateY(bx0, by0, bz0, rotAngleY), rotAngleX);
+      let [x1, y1, z1] = rotateX(...rotateY(bx1, by1, bz1, rotAngleY), rotAngleX);
+      let [x2, y2, z2] = rotateX(...rotateY(bx2, by2, bz2, rotAngleY), rotAngleX);
 
       x0 += panX; y0 += panY;
       x1 += panX; y1 += panY;
