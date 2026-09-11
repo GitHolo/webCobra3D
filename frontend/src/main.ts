@@ -210,7 +210,7 @@ class FlightDynamics {
     this.pitch += this.pitchRate * dt;
     this.yaw   += this.yawRate   * dt;
     this.roll  += this.rollRate  * dt;
-    this.pitch  = Math.max(-Math.PI / 2, Math.min(Math.PI / 2, this.pitch));
+    // No pitch clamp — jet can loop freely through 360°
 
     // Thrust along current body forward axis (thrust vectoring)
     const [fx, fy, fz] = rotateEuler(0, 0, 1, this.yaw, this.pitch, this.roll);
@@ -334,15 +334,19 @@ interface FaceEntry {
   x2: number; y2: number; z2: number;
   avgZ:       number;
   brightness: number;
-  kind:       0 | 1;   // 0 = jet (gold), 1 = terrain (green)
+  /** Base colour channels (0-255), multiplied by brightness at draw time. */
+  baseR: number; baseG: number; baseB: number;
+  /** 0 = jet (amber-gold), 1 = terrain (green), 2 = tree (dark green) */
+  kind: 0 | 1 | 2;
 }
 
-const MAX_FACES = 20000;
+const MAX_FACES = 30000;
 const facePool: FaceEntry[] = [];
 for (let i = 0; i < MAX_FACES; i++) {
   facePool.push({
     x0:0, y0:0, z0:0, x1:0, y1:0, z1:0, x2:0, y2:0, z2:0,
-    avgZ: 0, brightness: 1, kind: 0,
+    avgZ: 0, brightness: 1,
+    baseR: 255, baseG: 255, baseB: 255, kind: 0,
   });
 }
 
@@ -389,21 +393,21 @@ function frustumCull(
  */
 function pushTerrainFaces(startIdx: number, camWX: number, camWZ: number): number {
   let idx = startIdx;
-  const groundY = -5000;   // high-altitude: terrain floor 5000 world units below jet
-
-  // Jet's world-space Y — terrain is translated relative to this so the
-  // camera always orbits around the jet, not the world origin.
-  const camWY = flight.posY;
+  const groundY = -5000;   // terrain floor below jet origin
+  const camWY   = flight.posY;   // camera pivots around jet's world Y
 
   function toView(wx: number, wy: number, wz: number): [number, number, number] {
-    // Translate so the jet is at view-space origin, then normalise to model units
+    // Translate relative to jet (camera pivot = jet position in all 3 axes)
     const lx = (wx - camWX) / MODEL_SCALE;
-    const ly = (wy - camWY) / MODEL_SCALE;   // ← subtract jet Y
+    const ly = (wy - camWY) / MODEL_SCALE;
     const lz = (wz - camWZ) / MODEL_SCALE;
     let v = rotateY(lx, ly, lz, rotAngleY);
     v     = rotateX(v[0], v[1], v[2], rotAngleX);
     return [v[0] + panX, v[1] + panY, v[2]];
   }
+
+  // Terrain base colour (lit green)
+  const TR = 40, TG = 110, TB = 40;
 
   for (let gz = -TERRAIN_GRID_HALF; gz < TERRAIN_GRID_HALF; gz++) {
     for (let gx = -TERRAIN_GRID_HALF; gx < TERRAIN_GRID_HALF; gx++) {
@@ -425,24 +429,29 @@ function pushTerrainFaces(startIdx: number, camWX: number, camWZ: number): numbe
       const [cx, cy, cz] = toView(wx0, groundY + h01, wz1);
       const [dx, dy, dz] = toView(wx1, groundY + h11, wz1);
 
-      // Triangle 1: A, B, C
+      // Triangle 1: A, B, C  (no backface cull — terrain is always visible from above)
       if (idx < MAX_FACES && frustumCull(ax, ay, az, bx, by, bz, cx, cy, cz)) {
-        const [cnx, cny, cnz] = crossV3(bx-ax, by-ay, bz-az, cx-ax, cy-ay, cz-az);
-        const [nx, ny, nz]   = normaliseV3(cnx, cny, cnz);
+        let [cnx, cny, cnz] = crossV3(bx-ax, by-ay, bz-az, cx-ax, cy-ay, cz-az);
+        // Force normal to point upward in view space (ny > 0 after camera rot)
+        if (cny < 0) { cnx = -cnx; cny = -cny; cnz = -cnz; }
+        const [nx, ny, nz] = normaliseV3(cnx, cny, cnz);
         const br = 0.45 + 0.55 * Math.max(0, dotV3(nx, ny, nz, LIGHT[0], LIGHT[1], LIGHT[2]));
         const e  = facePool[idx++];
         e.x0=ax; e.y0=ay; e.z0=az; e.x1=bx; e.y1=by; e.z1=bz; e.x2=cx; e.y2=cy; e.z2=cz;
-        e.avgZ = (az+bz+cz)/3; e.brightness = br; e.kind = 1;
+        e.avgZ = (az+bz+cz)/3; e.brightness = br;
+        e.baseR = TR; e.baseG = TG; e.baseB = TB; e.kind = 1;
       }
 
       // Triangle 2: B, D, C
       if (idx < MAX_FACES && frustumCull(bx, by, bz, dx, dy, dz, cx, cy, cz)) {
-        const [cnx, cny, cnz] = crossV3(dx-bx, dy-by, dz-bz, cx-bx, cy-by, cz-bz);
-        const [nx, ny, nz]   = normaliseV3(cnx, cny, cnz);
+        let [cnx, cny, cnz] = crossV3(dx-bx, dy-by, dz-bz, cx-bx, cy-by, cz-bz);
+        if (cny < 0) { cnx = -cnx; cny = -cny; cnz = -cnz; }
+        const [nx, ny, nz] = normaliseV3(cnx, cny, cnz);
         const br = 0.45 + 0.55 * Math.max(0, dotV3(nx, ny, nz, LIGHT[0], LIGHT[1], LIGHT[2]));
         const e  = facePool[idx++];
         e.x0=bx; e.y0=by; e.z0=bz; e.x1=dx; e.y1=dy; e.z1=dz; e.x2=cx; e.y2=cy; e.z2=cz;
-        e.avgZ = (bz+dz+cz)/3; e.brightness = br; e.kind = 1;
+        e.avgZ = (bz+dz+cz)/3; e.brightness = br;
+        e.baseR = TR; e.baseG = TG; e.baseB = TB; e.kind = 1;
       }
     }
   }
@@ -450,19 +459,114 @@ function pushTerrainFaces(startIdx: number, camWX: number, camWZ: number): numbe
 }
 
 // ---------------------------------------------------------------------------
-// OBJ load
+// OBJ load — jet + tree in parallel
 // ---------------------------------------------------------------------------
 
-let objData: ObjData | null = null;
+let jetData:  ObjData | null = null;
+let treeData: ObjData | null = null;
 
 const loader = new ObjLoader();
-loader
-  .load('/su35.obj')
-  .then((data) => {
-    objData = data;
-    console.log(`su35.obj — ${data.vertices.length / 3} verts, ${data.indices.length / 3} tris`);
-  })
-  .catch((err: unknown) => console.error('Failed to load su35.obj:', err));
+Promise.all([
+  loader.load('/su35.obj'),
+  loader.load('/tree.obj'),
+]).then(([jet, tree]) => {
+  jetData  = jet;
+  treeData = tree;
+  console.log(`su35.obj — ${jet.vertices.length  / 3} verts, ${jet.indices.length  / 3} tris`);
+  console.log(`tree.obj  — ${tree.vertices.length / 3} verts, ${tree.indices.length / 3} tris`);
+}).catch((err: unknown) => console.error('Asset load failed:', err));
+
+// ---------------------------------------------------------------------------
+// Procedural forest scatter
+// ---------------------------------------------------------------------------
+
+const GROUND_Y        = -5000;   // must match pushTerrainFaces groundY
+const TREE_GRID_HALF  = 6;       // sparse grid cells either side of camera
+const TREE_CELL_SIZE  = TERRAIN_CELL_SIZE * 2;   // one tree per 2 terrain cells
+const TREE_SCALE      = 8;       // tree model scale (model units)
+
+/**
+ * Deterministic pseudo-random [0,1) from two integers.
+ * Simple LCG hash — stable across frames for the same cell.
+ */
+function cellRand(ix: number, iz: number): number {
+  let h = (ix * 1619 + iz * 31337) ^ (ix * iz);
+  h ^= h >>> 16; h = Math.imul(h, 0x45d9f3b);
+  h ^= h >>> 16;
+  return (h >>> 0) / 0x100000000;
+}
+
+/**
+ * Push instanced tree faces into facePool for visible trees near the camera.
+ * Each tree sits exactly on the terrain sine-wave surface.
+ */
+function pushTreeFaces(startIdx: number, camWX: number, camWZ: number): number {
+  if (!treeData) return startIdx;
+  let idx = startIdx;
+  const { vertices, indices } = treeData;
+  const camWY = flight.posY;
+
+  // Snap camera to tree-grid so the forest is stable
+  const gridOriginX = Math.round(camWX / TREE_CELL_SIZE) * TREE_CELL_SIZE;
+  const gridOriginZ = Math.round(camWZ / TREE_CELL_SIZE) * TREE_CELL_SIZE;
+
+  for (let gz = -TREE_GRID_HALF; gz <= TREE_GRID_HALF; gz++) {
+    for (let gx = -TREE_GRID_HALF; gx <= TREE_GRID_HALF; gx++) {
+      const cellX = gridOriginX + gx * TREE_CELL_SIZE;
+      const cellZ = gridOriginZ + gz * TREE_CELL_SIZE;
+
+      // Skip ~70% of cells so the forest is sparse
+      if (cellRand(cellX, cellZ) > 0.30) continue;
+
+      // Jitter within the cell using a second hash value
+      const jitter = TREE_CELL_SIZE * 0.4;
+      const wx = cellX + (cellRand(cellX + 1, cellZ)     - 0.5) * jitter;
+      const wz = cellZ + (cellRand(cellX,     cellZ + 1) - 0.5) * jitter;
+
+      // Tree base Y = terrain height at this XZ position
+      const wy = GROUND_Y + terrainHeight(wx, wz);
+
+      // Transform a single tree vertex to view space
+      function treeToView(vx: number, vy: number, vz: number): [number, number, number] {
+        // Scale model, offset to world position, then camera transform
+        const wx2 = wx + vx * TREE_SCALE;
+        const wy2 = wy + vy * TREE_SCALE;
+        const wz2 = wz + vz * TREE_SCALE;
+        const lx = (wx2 - camWX) / MODEL_SCALE;
+        const ly = (wy2 - camWY) / MODEL_SCALE;
+        const lz = (wz2 - camWZ) / MODEL_SCALE;
+        let v = rotateY(lx, ly, lz, rotAngleY);
+        v     = rotateX(v[0], v[1], v[2], rotAngleX);
+        return [v[0] + panX, v[1] + panY, v[2]];
+      }
+
+      // Instance all faces of the tree model
+      for (let i = 0; i < indices.length; i += 3) {
+        if (idx >= MAX_FACES) break;
+        const i0 = indices[i]     * 3;
+        const i1 = indices[i + 1] * 3;
+        const i2 = indices[i + 2] * 3;
+
+        const [ax, ay, az] = treeToView(vertices[i0], vertices[i0+1], vertices[i0+2]);
+        const [bx, by, bz] = treeToView(vertices[i1], vertices[i1+1], vertices[i1+2]);
+        const [cx, cy, cz] = treeToView(vertices[i2], vertices[i2+1], vertices[i2+2]);
+
+        if (!frustumCull(ax, ay, az, bx, by, bz, cx, cy, cz)) continue;
+
+        const [cnx, cny, cnz] = crossV3(bx-ax, by-ay, bz-az, cx-ax, cy-ay, cz-az);
+        if (cnz >= 0) continue;   // backface
+
+        const [nx, ny, nz] = normaliseV3(cnx, cny, cnz);
+        const br = 0.45 + 0.55 * Math.max(0, dotV3(nx, ny, nz, LIGHT[0], LIGHT[1], LIGHT[2]));
+        const e  = facePool[idx++];
+        e.x0=ax; e.y0=ay; e.z0=az; e.x1=bx; e.y1=by; e.z1=bz; e.x2=cx; e.y2=cy; e.z2=cz;
+        e.avgZ = (az+bz+cz)/3; e.brightness = br;
+        e.baseR = 25; e.baseG = 80; e.baseB = 25; e.kind = 2;
+      }
+    }
+  }
+  return idx;
+}
 
 // ---------------------------------------------------------------------------
 // Render loop
@@ -494,10 +598,15 @@ function tick(ts: DOMHighResTimeStamp): void {
   visibleCount = pushTerrainFaces(visibleCount, camWX, camWZ);
 
   // -----------------------------------------------------------------------
+  // Collect tree instance faces (frustum-culled, backface-culled)
+  // -----------------------------------------------------------------------
+  visibleCount = pushTreeFaces(visibleCount, camWX, camWZ);
+
+  // -----------------------------------------------------------------------
   // Collect jet OBJ faces (backface-culled)
   // -----------------------------------------------------------------------
-  if (objData) {
-    const { vertices, indices } = objData;
+  if (jetData) {
+    const { vertices, indices } = jetData;
 
     for (let i = 0; i < indices.length; i += 3) {
       const i0 = indices[i]     * 3;
@@ -505,7 +614,6 @@ function tick(ts: DOMHighResTimeStamp): void {
       const i2 = indices[i + 2] * 3;
 
       // Step 1 — apply jet's own flight orientation (body → world)
-      //   yaw first, then pitch, then roll  (standard aerospace convention)
       let [bx0, by0, bz0] = rotateEuler(vertices[i0], vertices[i0+1], vertices[i0+2], flight.yaw, flight.pitch, flight.roll);
       let [bx1, by1, bz1] = rotateEuler(vertices[i1], vertices[i1+1], vertices[i1+2], flight.yaw, flight.pitch, flight.roll);
       let [bx2, by2, bz2] = rotateEuler(vertices[i2], vertices[i2+1], vertices[i2+2], flight.yaw, flight.pitch, flight.roll);
@@ -529,7 +637,8 @@ function tick(ts: DOMHighResTimeStamp): void {
       if (visibleCount < MAX_FACES) {
         const e = facePool[visibleCount++];
         e.x0=x0; e.y0=y0; e.z0=z0; e.x1=x1; e.y1=y1; e.z1=z1; e.x2=x2; e.y2=y2; e.z2=z2;
-        e.avgZ = (z0+z1+z2)/3; e.brightness = brightness; e.kind = 0;
+        e.avgZ = (z0+z1+z2)/3; e.brightness = brightness;
+        e.baseR = 252; e.baseG = 186; e.baseB = 3; e.kind = 0;
       }
     }
   }
@@ -544,24 +653,15 @@ function tick(ts: DOMHighResTimeStamp): void {
   // PASS 3 — draw with PS1-snapped vertices
   // -----------------------------------------------------------------------
   for (let f = 0; f < visibleFaces.length; f++) {
-    const { x0, y0, z0, x1, y1, z1, x2, y2, z2, brightness, kind } = visibleFaces[f];
+    const { x0, y0, z0, x1, y1, z1, x2, y2, z2, brightness, baseR, baseG, baseB } = visibleFaces[f];
 
     const [sx0, sy0] = projectSnapped(x0, y0, z0);
     const [sx1, sy1] = projectSnapped(x1, y1, z1);
     const [sx2, sy2] = projectSnapped(x2, y2, z2);
 
-    let r: number, g: number, b: number;
-    if (kind === 0) {
-      // Jet — amber-gold
-      r = Math.round(brightness * 252);
-      g = Math.round(brightness * 186);
-      b = Math.round(brightness * 3);
-    } else {
-      // Terrain — muted green
-      r = Math.round(brightness * 40);
-      g = Math.round(brightness * 140);
-      b = Math.round(brightness * 55);
-    }
+    const r = Math.round(brightness * baseR);
+    const g = Math.round(brightness * baseG);
+    const b = Math.round(brightness * baseB);
 
     ctx!.fillStyle   = `rgb(${r},${g},${b})`;
     ctx!.strokeStyle = `rgb(${r},${g},${b})`;
@@ -579,18 +679,26 @@ function tick(ts: DOMHighResTimeStamp): void {
   // -----------------------------------------------------------------------
   // HUD overlay
   // -----------------------------------------------------------------------
-  const spd    = Math.sqrt(flight.velX**2 + flight.velY**2 + flight.velZ**2).toFixed(2);
-  const alt    = flight.posY.toFixed(2);
-  const thr    = flight.thrust.toFixed(2);
-  const aoa    = (flight.angleOfAttack * 180 / Math.PI).toFixed(1);
-  const pitD   = (flight.pitch * 180 / Math.PI).toFixed(1);
-  const yawD   = (flight.yaw   * 180 / Math.PI).toFixed(1);
+  const spd  = Math.sqrt(flight.velX**2 + flight.velY**2 + flight.velZ**2).toFixed(1);
+  const alt  = flight.posY.toFixed(0);
+  const thr  = flight.thrust.toFixed(1);
+  const aoa  = (flight.angleOfAttack * 180 / Math.PI).toFixed(1);
+
+  /** Normalise any radian angle to a [0, 360) degree string. */
+  function normDeg(rad: number): string {
+    const deg = rad * 180 / Math.PI;
+    return Math.round(((deg % 360) + 360) % 360).toString();
+  }
+
+  const pitD = normDeg(flight.pitch);
+  const yawD = normDeg(flight.yaw);
+  const rolD = normDeg(flight.roll);
 
   ctx!.fillStyle = 'rgba(0,255,100,0.85)';
   ctx!.font      = '13px monospace';
   ctx!.fillText(`SPD  ${spd}   ALT  ${alt}`, 14, 20);
   ctx!.fillText(`THR  ${thr}   AoA  ${aoa}°`, 14, 36);
-  ctx!.fillText(`PIT  ${pitD}°   YAW  ${yawD}°`, 14, 52);
+  ctx!.fillText(`PIT  ${pitD}°  YAW  ${yawD}°  ROL  ${rolD}°`, 14, 52);
   ctx!.fillText(`Z_OFF ${Z_OFFSET.toFixed(0)}  [scroll=zoom  RMB=rot  MMB=pan]`, 14, 68);
 
   requestAnimationFrame(tick);
