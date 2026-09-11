@@ -28,7 +28,7 @@ canvas.style.cursor            = 'crosshair';
 // ---------------------------------------------------------------------------
 
 const FOCAL_LENGTH = 600;
-let   Z_OFFSET     = 500;          // mutable — scrollwheel zooms this
+let   Z_OFFSET     = 2500;         // mutable — scrollwheel zooms this
 const MODEL_SCALE  = 80;
 /** Snap granularity in real canvas pixels. Higher = chunkier PS1 wobble. */
 const JITTER       = 5;
@@ -218,8 +218,8 @@ class FlightDynamics {
     this.velY += fy * this.thrust * dt;
     this.velZ += fz * this.thrust * dt;
 
-    // Simple aerodynamic drag
-    const drag = 0.995;
+    // Simple aerodynamic drag (loose — terminal velocity ∝ thrust / (1 - drag^60fps))
+    const drag = 0.9995;
     this.velX *= drag;
     this.velY *= drag;
     this.velZ *= drag;
@@ -232,7 +232,7 @@ class FlightDynamics {
 }
 
 const flight = new FlightDynamics();
-flight.thrust    = 50;   // 100× original — supersonic acceleration
+flight.thrust    = 1000;   // ×20 — supersonic at new world scale
 flight.pitchRate = 0.0;
 
 // ---------------------------------------------------------------------------
@@ -256,12 +256,12 @@ window.addEventListener('keyup', (e) => { keys[e.code] = false; });
  * RATE_DECAY:           natural decay applied when no key is pressed (per frame factor).
  * THROTTLE_STEP:        thrust units added/removed per second of key hold.
  */
-const PITCH_ACCEL   = 0.8;    // rad/s²
-const ROLL_ACCEL    = 1.2;    // rad/s²
-const YAW_ACCEL     = 0.5;    // rad/s²
-const RATE_DECAY    = 0.88;   // bleed rate so releasing a key smoothly damps rotation
-const THROTTLE_STEP = 30;     // thrust units / s
-const THROTTLE_MAX  = 500;
+const PITCH_ACCEL   = 0.8;      // rad/s²
+const ROLL_ACCEL    = 1.2;      // rad/s²
+const YAW_ACCEL     = 0.5;      // rad/s²
+const RATE_DECAY    = 0.88;     // bleed rate so releasing a key smoothly damps rotation
+const THROTTLE_STEP = 600;      // thrust units / s  (×20)
+const THROTTLE_MAX  = 10000;    // ×20
 
 /** Apply keyboard state to FlightDynamics rates and throttle before physics step. */
 function applyKeyInputs(dt: number): void {
@@ -311,16 +311,16 @@ function applyKeyInputs(dt: number): void {
  * the same screen edge the triangle is discarded (conservative, no clipping).
  */
 
-const TERRAIN_GRID_HALF = 80;      // cells in each direction — 80×80 total
-const TERRAIN_CELL_SIZE = 300;     // 100× wider cells — massive world scale
+const TERRAIN_GRID_HALF = 80;        // cells in each direction — 80×80 total
+const TERRAIN_CELL_SIZE = 6000;      // ×20 wider — massive world scale
 
 function terrainHeight(wx: number, wz: number): number {
-  // Wide rolling hills — amplitudes kept small relative to cell size
+  // Rolling hills — frequencies scaled to match new cell size, amplitudes ×20
   return (
-    Math.sin(wx * 0.00180) * 250 +
-    Math.sin(wz * 0.00130) * 200 +
-    Math.sin((wx + wz) * 0.00090) * 120 +
-    Math.sin(wx * 0.00350 - wz * 0.00220) * 60
+    Math.sin(wx * 0.000090) * 5000 +
+    Math.sin(wz * 0.000065) * 4000 +
+    Math.sin((wx + wz) * 0.000045) * 2400 +
+    Math.sin(wx * 0.000175 - wz * 0.000110) * 1200
   );
 }
 
@@ -393,7 +393,7 @@ function frustumCull(
  */
 function pushTerrainFaces(startIdx: number, camWX: number, camWZ: number): number {
   let idx = startIdx;
-  const groundY = -5000;   // terrain floor below jet origin
+  const groundY = GROUND_Y;   // terrain floor — shared with tree scatter
   const camWY   = flight.posY;   // camera pivots around jet's world Y
 
   function toView(wx: number, wy: number, wz: number): [number, number, number] {
@@ -480,10 +480,10 @@ Promise.all([
 // Procedural forest scatter
 // ---------------------------------------------------------------------------
 
-const GROUND_Y        = -5000;   // must match pushTerrainFaces groundY
-const TREE_GRID_HALF  = 6;       // sparse grid cells either side of camera
+const GROUND_Y        = -100000;  // ×20 deeper — matches new terrain scale
+const TREE_GRID_HALF  = 6;        // sparse grid cells either side of camera
 const TREE_CELL_SIZE  = TERRAIN_CELL_SIZE * 2;   // one tree per 2 terrain cells
-const TREE_SCALE      = 8;       // tree model scale (model units)
+const TREE_SCALE      = 160;      // ×20 larger — proportional to terrain
 
 /**
  * Deterministic pseudo-random [0,1) from two integers.
