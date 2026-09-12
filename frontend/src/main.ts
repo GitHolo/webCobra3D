@@ -107,7 +107,9 @@ canvas.addEventListener('wheel', (e) => {
 
 function normaliseV3(x: number, y: number, z: number): [number, number, number] {
   const len = Math.sqrt(x * x + y * y + z * z);
-  return len > 0 ? [x / len, y / len, z / len] : [0, 0, 0];
+  // Guard: if nearly zero-length, return a safe non-zero default rather than dividing by ~0
+  // which would produce Infinity or NaN that silently poisons all downstream calculations.
+  return len > 0.00001 ? [x / len, y / len, z / len] : [0, 0, 1];
 }
 
 function dotV3(ax: number, ay: number, az: number,
@@ -168,65 +170,156 @@ function projectSnapped(x: number, y: number, z: number): [number, number] {
 }
 
 // ---------------------------------------------------------------------------
-// FlightDynamics
+// FlightDynamics — basis-vector orientation (no Euler angles, no gimbal lock)
 // ---------------------------------------------------------------------------
 
+/**
+ * Physics constants.  Tuned for MODEL_SCALE = 80; cruise airspeed ~80–150 u/s.
+ */
+const GRAVITY        = 35;     // world-units / s² downward
+const LIFT_COEFF     = 0.004;  // lift = LIFT_COEFF × v²  (balances gravity at ~94 u/s)
+const DRAG_BASE      = 0.995;  // base drag per normalised frame (60 fps ref)
+const DRAG_AOA_SCALE = 4.0;    // AoA drag exponent — 90° AoA ≈ 55× extra bleed
+const MOMENTUM_ALIGN = 0.4;    // velocity→forward alignment rate (airspeed-scaled)
+const AIRSPEED_REF   = 100;    // control authority saturates at this airspeed
+/** FBW roll-level torque strength (rad/s² applied toward wings-level). */
+const FBW_ROLL_STR   = 2.5;
+/** FBW pitch-level torque strength (rad/s² toward nose-level). */
+const FBW_PITCH_STR  = 1.2;
+
+/**
+ * Rotate vector (vx,vy,vz) around unit axis (ax,ay,az) by angle θ (rad).
+ * Uses Rodrigues' rotation formula — numerically stable, no gimbal lock.
+ */
+function rotateAroundAxis(
+  vx: number, vy: number, vz: number,
+  ax: number, ay: number, az: number,
+  theta: number,
+): [number, number, number] {
+  const c = Math.cos(theta), s = Math.sin(theta), t = 1 - c;
+  const dot = ax * vx + ay * vy + az * vz;
+  // cross(axis, v)
+  const crx = ay * vz - az * vy;
+  const cry = az * vx - ax * vz;
+  const crz = ax * vy - ay * vx;
+  return [
+    vx * c + crx * s + ax * dot * t,
+    vy * c + cry * s + ay * dot * t,
+    vz * c + crz * s + az * dot * t,
+  ];
+}
+
 class FlightDynamics {
-  // World-space position (model units)
+  // World-space position
   posX = 0; posY = 0; posZ = 0;
 
-  // World-space velocity
+  /**
+   * Orthonormal basis — the jet's local coordinate frame in world space.
+   * Initialised pointing forward along +Z, up along +Y.
+   * These replace pitch/yaw/roll entirely.
+   */
+  fwdX = 0; fwdY = 0; fwdZ = 1;   // nose direction
+  upX  = 0; upY  = 1; upZ  = 0;   // roof direction
+  rgtX = 1; rgtY = 0; rgtZ = 0;   // right-wing direction
+
+  /** World-space velocity — decoupled from nose direction. */
   velX = 0; velY = 0; velZ = 0;
 
-  // Euler angles (radians)
-  yaw   = 0;   // heading
-  pitch = 0;   // nose up / down
-  roll  = 0;   // bank
-
-  // Angular rates (radians / s)
-  pitchRate = 0;
-  yawRate   = 0;
-  rollRate  = 0;
-
-  /** Thrust magnitude (model units / s²). Independent of forward velocity. */
+  /** Engine thrust (world-units / s²). */
   thrust = 0;
 
-  /** Angle of Attack — angle between velocity vector and body forward axis (rad). */
+  /** Airspeed magnitude — updated each tick by update(). */
+  airspeed = 0;
+
+  /** Angle of Attack: angle between velocity vector and forward axis (rad). */
   get angleOfAttack(): number {
-    const [fx, fy, fz] = rotateEuler(0, 0, 1, this.yaw, this.pitch, this.roll);
-    const spd = Math.sqrt(this.velX ** 2 + this.velY ** 2 + this.velZ ** 2);
-    if (spd < 0.0001) return 0;
-    const dot = (this.velX * fx + this.velY * fy + this.velZ * fz) / spd;
+    if (this.airspeed < 0.0001) return 0;
+    const dot = (this.velX * this.fwdX + this.velY * this.fwdY + this.velZ * this.fwdZ)
+                / this.airspeed;
     return Math.acos(Math.max(-1, Math.min(1, dot)));
   }
 
   /**
-   * Step the simulation by dt seconds.
+   * Rotate the basis vectors around a local axis by angle θ.
+   * axis must be one of the three basis vectors (or their negation).
+   */
+  rotateBasis(ax: number, ay: number, az: number, theta: number): void {
+    [this.fwdX, this.fwdY, this.fwdZ] =
+      rotateAroundAxis(this.fwdX, this.fwdY, this.fwdZ, ax, ay, az, theta);
+    [this.upX,  this.upY,  this.upZ]  =
+      rotateAroundAxis(this.upX,  this.upY,  this.upZ,  ax, ay, az, theta);
+    [this.rgtX, this.rgtY, this.rgtZ] =
+      rotateAroundAxis(this.rgtX, this.rgtY, this.rgtZ, ax, ay, az, theta);
+  }
+
+  /**
+   * Re-orthonormalise the basis to stop floating-point drift accumulating.
+   * Called once per tick after all rotations.
+   */
+  orthonormalise(): void {
+    // fwd is the primary axis — normalise it first.
+    [this.fwdX, this.fwdY, this.fwdZ] =
+      normaliseV3(this.fwdX, this.fwdY, this.fwdZ);
+
+    // rgt = normalise(up × fwd)
+    // Right-hand rule: with fwd=+Z and up=+Y, cross(up,fwd) = cross(Y,Z) = +X  ✓
+    // The previous cross(fwd,up) = cross(Z,Y) = −X, which reflected the mesh inside-out.
+    const [rx, ry, rz] = normaliseV3(
+      ...crossV3(this.upX, this.upY, this.upZ, this.fwdX, this.fwdY, this.fwdZ)
+    );
+    this.rgtX = rx; this.rgtY = ry; this.rgtZ = rz;
+
+    // up = normalise(fwd × rgt)  — closes the right-handed triad
+    const [ux, uy, uz] = normaliseV3(
+      ...crossV3(this.fwdX, this.fwdY, this.fwdZ, rx, ry, rz)
+    );
+    this.upX = ux; this.upY = uy; this.upZ = uz;
+  }
+
+  /**
+   * Advance simulation by dt seconds.
    *
-   * Thrust vectoring: thrust always acts along the body forward axis, so
-   * pitching the nose directly changes the thrust direction independent of
-   * the current velocity vector.
+   *  1. Apply thrust along forward
+   *  2. Gravity
+   *  3. Lift (v²-proportional, upward)
+   *  4. AoA drag
+   *  5. Base drag
+   *  6. Momentum drift (vel lerps toward fwd)
+   *  7. Integrate position
    */
   update(dt: number): void {
-    // Integrate angular rates into Euler angles
-    this.pitch += this.pitchRate * dt;
-    this.yaw   += this.yawRate   * dt;
-    this.roll  += this.rollRate  * dt;
-    // No pitch clamp — jet can loop freely through 360°
+    const airFrac = Math.min(1, this.airspeed / AIRSPEED_REF);
 
-    // Thrust along current body forward axis (thrust vectoring)
-    const [fx, fy, fz] = rotateEuler(0, 0, 1, this.yaw, this.pitch, this.roll);
-    this.velX += fx * this.thrust * dt;
-    this.velY += fy * this.thrust * dt;
-    this.velZ += fz * this.thrust * dt;
+    // ---- 1. Thrust ----
+    this.velX += this.fwdX * this.thrust * dt;
+    this.velY += this.fwdY * this.thrust * dt;
+    this.velZ += this.fwdZ * this.thrust * dt;
 
-    // Simple aerodynamic drag (loose — terminal velocity ∝ thrust / (1 - drag^60fps))
-    const drag = 0.9995;
-    this.velX *= drag;
-    this.velY *= drag;
-    this.velZ *= drag;
+    // ---- 2. Gravity ----
+    this.velY -= GRAVITY * dt;
 
-    // Integrate position
+    // ---- 3. Lift ----
+    const spd2 = this.velX ** 2 + this.velY ** 2 + this.velZ ** 2;
+    this.airspeed = Math.sqrt(spd2);
+    this.velY += LIFT_COEFF * spd2 * dt;
+
+    // ---- 4. AoA drag ----
+    const aoa     = this.angleOfAttack;
+    const aoaFrac = aoa / (Math.PI / 2);
+    const aoaDrag = Math.exp(-DRAG_AOA_SCALE * aoaFrac * dt);
+    this.velX *= aoaDrag; this.velY *= aoaDrag; this.velZ *= aoaDrag;
+
+    // ---- 5. Base drag ----
+    const bd = Math.pow(DRAG_BASE, dt * 60);
+    this.velX *= bd; this.velY *= bd; this.velZ *= bd;
+
+    // ---- 6. Momentum drift ----
+    const ar = MOMENTUM_ALIGN * airFrac * dt;
+    this.velX += (this.fwdX * this.airspeed - this.velX) * ar;
+    this.velY += (this.fwdY * this.airspeed - this.velY) * ar;
+    this.velZ += (this.fwdZ * this.airspeed - this.velZ) * ar;
+
+    // ---- 7. Integrate position ----
     this.posX += this.velX * dt;
     this.posY += this.velY * dt;
     this.posZ += this.velZ * dt;
@@ -234,8 +327,7 @@ class FlightDynamics {
 }
 
 const flight = new FlightDynamics();
-flight.thrust    = 100;   // ×20 — supersonic at new world scale
-flight.pitchRate = 0.0;
+flight.thrust = 60;
 
 // ---------------------------------------------------------------------------
 // Keyboard input state
@@ -245,54 +337,82 @@ const keys: Record<string, boolean> = {};
 
 window.addEventListener('keydown', (e) => {
   keys[e.code] = true;
-  // Prevent arrow keys / space from scrolling the page
   if (['Space','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.code)) {
     e.preventDefault();
   }
 });
 window.addEventListener('keyup', (e) => { keys[e.code] = false; });
 
+/** Input ramp rates (rad/s²) — dynamic pressure scaling applied inside applyKeyInputs. */
+const PITCH_ACCEL   = 1.5;
+const ROLL_ACCEL    = 2.0;
+const YAW_ACCEL     = 0.8;
+const THROTTLE_STEP = 15;
+const THROTTLE_MAX  = 150;
+
 /**
- * Constants for how fast controls change angular rates and throttle.
- * PITCH/ROLL/YAW_ACCEL: how fast rates ramp up while a key is held (rad/s per s).
- * RATE_DECAY:           natural decay applied when no key is pressed (per frame factor).
- * THROTTLE_STEP:        thrust units added/removed per second of key hold.
+ * Translate keyboard state into local-axis rotations on the jet's basis vectors.
+ *
+ * Pitch  — rotate fwd/up/rgt around the local RIGHT axis  (rgt)
+ * Roll   — rotate fwd/up/rgt around the local FORWARD axis (fwd)
+ * Yaw    — rotate fwd/up/rgt around the local UP axis     (up)
+ *
+ * Control authority scales with airFrac (dynamic pressure).
+ *
+ * FBW auto-level (when no roll/pitch key held):
+ *   Roll  → cross(up, worldUp) gives the rotation axis; its magnitude is sin(tilt angle).
+ *           Apply corrective torque along fwd to roll back to wings-level via shortest path.
+ *   Pitch → dot(fwd, worldUp) measures how far the nose deviates from horizontal.
+ *           Apply corrective torque along rgt to nudge nose back to level.
  */
-const PITCH_ACCEL   = 0.8;      // rad/s²
-const ROLL_ACCEL    = 1.2;      // rad/s²
-const YAW_ACCEL     = 0.5;      // rad/s²
-const RATE_DECAY    = 0.88;     // bleed rate so releasing a key smoothly damps rotation
-const THROTTLE_STEP = 10;      // thrust units / s  (×20)
-const THROTTLE_MAX  = 100;    // ×20
-
-/** Apply keyboard state to FlightDynamics rates and throttle before physics step. */
 function applyKeyInputs(dt: number): void {
-  // --- Pitch: S = nose up (negative pitch rate), W = nose down ---
-  if (keys['KeyS']) {
-    flight.pitchRate -= PITCH_ACCEL * dt;
-  } else if (keys['KeyW']) {
-    flight.pitchRate += PITCH_ACCEL * dt;
+  const airFrac = Math.min(1, flight.airspeed / AIRSPEED_REF);
+
+  // --- Pitch: W = nose up (rotate around +rgt), S = nose down (rotate around −rgt) ---
+  if (keys['KeyW']) {
+    const angle = PITCH_ACCEL * airFrac * dt;
+    flight.rotateBasis(flight.rgtX, flight.rgtY, flight.rgtZ, -angle);
+  } else if (keys['KeyS']) {
+    const angle = PITCH_ACCEL * airFrac * dt;
+    flight.rotateBasis(flight.rgtX, flight.rgtY, flight.rgtZ, +angle);
   } else {
-    flight.pitchRate *= RATE_DECAY;
+    // FBW pitch: nose drifts toward horizontal (fwd.y → 0)
+    // Torque axis = local right; magnitude proportional to how pitched-up the nose is.
+    const pitchErr = flight.fwdY;   // +1 = pointing straight up, -1 = pointing straight down
+    const fbwAngle = FBW_PITCH_STR * pitchErr * dt;
+    flight.rotateBasis(flight.rgtX, flight.rgtY, flight.rgtZ, -fbwAngle);
   }
 
-  // --- Roll: A = roll left, D = roll right ---
+  // --- Roll: A = roll left, D = roll right (rotate around local forward) ---
   if (keys['KeyA']) {
-    flight.rollRate -= ROLL_ACCEL * dt;
+    const angle = ROLL_ACCEL * airFrac * dt;
+    flight.rotateBasis(flight.fwdX, flight.fwdY, flight.fwdZ, -angle);
   } else if (keys['KeyD']) {
-    flight.rollRate += ROLL_ACCEL * dt;
+    const angle = ROLL_ACCEL * airFrac * dt;
+    flight.rotateBasis(flight.fwdX, flight.fwdY, flight.fwdZ, +angle);
   } else {
-    flight.rollRate *= RATE_DECAY;
+    // FBW roll: cross(up, worldUp) gives axis+magnitude to roll to wings-level.
+    // Guard: when upY ≈ ±1 the jet is pointing straight up/down — cross product
+    // is near-zero (singular), so skip FBW roll this frame to avoid NaN.
+    const upDotWorld = flight.upY;   // dot(up, [0,1,0]) == upY
+    if (Math.abs(upDotWorld) < 0.9999) {
+      const [cx, , cz] = crossV3(flight.upX, flight.upY, flight.upZ, 0, 1, 0);
+      // Project the cross product onto the forward axis to get signed roll error
+      const rollErr  = cx * flight.fwdX + cz * flight.fwdZ;
+      const fbwAngle = FBW_ROLL_STR * rollErr * dt;
+      flight.rotateBasis(flight.fwdX, flight.fwdY, flight.fwdZ, fbwAngle);
+    }
   }
 
-  // --- Yaw: Q = yaw left, E = yaw right ---
+  // --- Yaw: Q = left, E = right (rotate around local up) ---
   if (keys['KeyQ']) {
-    flight.yawRate -= YAW_ACCEL * dt;
+    const angle = YAW_ACCEL * airFrac * dt;
+    flight.rotateBasis(flight.upX, flight.upY, flight.upZ, -angle);
   } else if (keys['KeyE']) {
-    flight.yawRate += YAW_ACCEL * dt;
-  } else {
-    flight.yawRate *= RATE_DECAY;
+    const angle = YAW_ACCEL * airFrac * dt;
+    flight.rotateBasis(flight.upX, flight.upY, flight.upZ, +angle);
   }
+  // No yaw auto-level — heading holds wherever you leave it.
 
   // --- Throttle: Shift = increase, Ctrl = decrease ---
   if (keys['ShiftLeft'] || keys['ShiftRight']) {
@@ -300,6 +420,9 @@ function applyKeyInputs(dt: number): void {
   } else if (keys['ControlLeft'] || keys['ControlRight']) {
     flight.thrust = Math.max(0, flight.thrust - THROTTLE_STEP * dt);
   }
+
+  // Re-orthonormalise once per tick to drain accumulated floating-point error
+  flight.orthonormalise();
 }
 
 // ---------------------------------------------------------------------------
@@ -634,19 +757,26 @@ function tick(ts: DOMHighResTimeStamp): void {
       const i1 = indices[i + 1] * 3;
       const i2 = indices[i + 2] * 3;
 
-      // Step 1 — scale jet vertices to keep proportions at low Z_OFFSET, then apply flight orientation
-      let [bx0, by0, bz0] = rotateEuler(vertices[i0]*JET_VERTEX_SCALE, vertices[i0+1]*JET_VERTEX_SCALE, vertices[i0+2]*JET_VERTEX_SCALE, flight.yaw, flight.pitch, flight.roll);
-      let [bx1, by1, bz1] = rotateEuler(vertices[i1]*JET_VERTEX_SCALE, vertices[i1+1]*JET_VERTEX_SCALE, vertices[i1+2]*JET_VERTEX_SCALE, flight.yaw, flight.pitch, flight.roll);
-      let [bx2, by2, bz2] = rotateEuler(vertices[i2]*JET_VERTEX_SCALE, vertices[i2+1]*JET_VERTEX_SCALE, vertices[i2+2]*JET_VERTEX_SCALE, flight.yaw, flight.pitch, flight.roll);
+      // Step 1 — transform OBJ local-space vertex into world-relative view space.
+      // The 3×3 rotation matrix is [rgt | up | fwd] (columns), so:
+      //   world_vec = lx*rgt + ly*up + lz*fwd
+      // where lx/ly/lz are the scaled local-space vertex components.
+      function jetVertToView(vi: number): [number, number, number] {
+        const lx = vertices[vi]   * JET_VERTEX_SCALE;
+        const ly = vertices[vi+1] * JET_VERTEX_SCALE;
+        const lz = vertices[vi+2] * JET_VERTEX_SCALE;
+        // Rotate into world orientation using the basis matrix
+        const bx = lx * flight.rgtX + ly * flight.upX + lz * flight.fwdX;
+        const by = lx * flight.rgtY + ly * flight.upY + lz * flight.fwdY;
+        const bz = lx * flight.rgtZ + ly * flight.upZ + lz * flight.fwdZ;
+        // Step 2 — apply camera orbit (mouse rotation) on top
+        let v = rotateX(...rotateY(bx, by, bz, rotAngleY), rotAngleX);
+        return [v[0] + panX, v[1] + panY, v[2]];
+      }
 
-      // Step 2 — apply camera orbit (mouse rotation) on top
-      let [x0, y0, z0] = rotateX(...rotateY(bx0, by0, bz0, rotAngleY), rotAngleX);
-      let [x1, y1, z1] = rotateX(...rotateY(bx1, by1, bz1, rotAngleY), rotAngleX);
-      let [x2, y2, z2] = rotateX(...rotateY(bx2, by2, bz2, rotAngleY), rotAngleX);
-
-      x0 += panX; y0 += panY;
-      x1 += panX; y1 += panY;
-      x2 += panX; y2 += panY;
+      const [x0, y0, z0] = jetVertToView(i0);
+      const [x1, y1, z1] = jetVertToView(i1);
+      const [x2, y2, z2] = jetVertToView(i2);
 
       const [cnx, cny, cnz] = crossV3(x1-x0, y1-y0, z1-z0, x2-x0, y2-y0, z2-z0);
       if (cnz >= 0) continue;   // backface
@@ -722,21 +852,24 @@ function tick(ts: DOMHighResTimeStamp): void {
   const thr  = flight.thrust.toFixed(1);
   const aoa  = (flight.angleOfAttack * 180 / Math.PI).toFixed(1);
 
-  /** Normalise any radian angle to a [0, 360) degree string. */
-  function normDeg(rad: number): string {
-    const deg = rad * 180 / Math.PI;
+  // Derive displayable attitude angles from basis vectors.
+  // All inputs clamped to [-1, 1] to prevent NaN from floating-point overshoot.
+  /** Pitch: elevation of the nose above/below the horizon. asin(-fwdY) in degrees. */
+  const pitDeg = Math.asin(Math.max(-1, Math.min(1, -flight.fwdY))) * 180 / Math.PI;
+  /** Yaw: heading angle in XZ plane. atan2 is always safe (no domain restriction). */
+  const yawDeg = Math.atan2(flight.fwdX, flight.fwdZ) * 180 / Math.PI;
+  /** Roll: bank angle — how far rgt is tilted from horizontal. */
+  const rolDeg = Math.atan2(flight.rgtY, flight.upY) * 180 / Math.PI;
+
+  function fmtDeg(deg: number): string {
     return Math.round(((deg % 360) + 360) % 360).toString();
   }
-
-  const pitD = normDeg(flight.pitch);
-  const yawD = normDeg(flight.yaw);
-  const rolD = normDeg(flight.roll);
 
   ctx!.fillStyle = 'rgba(0,255,100,0.85)';
   ctx!.font      = '13px monospace';
   ctx!.fillText(`SPD  ${spd}   ALT  ${alt}`, 14, 20);
   ctx!.fillText(`THR  ${thr}   AoA  ${aoa}°`, 14, 36);
-  ctx!.fillText(`PIT  ${pitD}°  YAW  ${yawD}°  ROL  ${rolD}°`, 14, 52);
+  ctx!.fillText(`PIT  ${fmtDeg(pitDeg)}°  YAW  ${fmtDeg(yawDeg)}°  ROL  ${fmtDeg(rolDeg)}°`, 14, 52);
   ctx!.fillText(`Z_OFF ${Z_OFFSET.toFixed(0)}  [scroll=zoom  RMB=rot  MMB=pan]`, 14, 68);
 
   requestAnimationFrame(tick);
