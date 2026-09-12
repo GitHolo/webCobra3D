@@ -27,11 +27,13 @@ canvas.style.cursor            = 'crosshair';
 // Rendering constants
 // ---------------------------------------------------------------------------
 
-const FOCAL_LENGTH = 600;
-let   Z_OFFSET     = 2500;         // mutable — scrollwheel zooms this
-const MODEL_SCALE  = 80;
+const FOCAL_LENGTH = 250;
+let   Z_OFFSET     = 150;        // mutable — scrollwheel zooms this (tight = intense depth)
+const MODEL_SCALE      = 80;
+/** Scale applied to raw OBJ jet vertices so the jet stays proportional at low Z_OFFSET. */
+const JET_VERTEX_SCALE = 0.05;
 /** Snap granularity in real canvas pixels. Higher = chunkier PS1 wobble. */
-const JITTER       = 5;
+const JITTER           = 5;
 
 const LIGHT: [number, number, number] = normaliseV3(0.4, 0.7, -0.6);
 
@@ -96,7 +98,7 @@ canvas.addEventListener('wheel', (e) => {
   e.preventDefault();
   // deltaY > 0 → scroll down → zoom out (object further away → increase Z_OFFSET)
   Z_OFFSET += e.deltaY * ZOOM_SENSITIVITY * 0.01;
-  Z_OFFSET  = Math.max(50, Math.min(500_000, Z_OFFSET));
+  Z_OFFSET  = Math.max(10, Math.min(500_000, Z_OFFSET));
 }, { passive: false });
 
 // ---------------------------------------------------------------------------
@@ -232,7 +234,7 @@ class FlightDynamics {
 }
 
 const flight = new FlightDynamics();
-flight.thrust    = 1000;   // ×20 — supersonic at new world scale
+flight.thrust    = 100;   // ×20 — supersonic at new world scale
 flight.pitchRate = 0.0;
 
 // ---------------------------------------------------------------------------
@@ -260,15 +262,15 @@ const PITCH_ACCEL   = 0.8;      // rad/s²
 const ROLL_ACCEL    = 1.2;      // rad/s²
 const YAW_ACCEL     = 0.5;      // rad/s²
 const RATE_DECAY    = 0.88;     // bleed rate so releasing a key smoothly damps rotation
-const THROTTLE_STEP = 600;      // thrust units / s  (×20)
-const THROTTLE_MAX  = 10000;    // ×20
+const THROTTLE_STEP = 10;      // thrust units / s  (×20)
+const THROTTLE_MAX  = 100;    // ×20
 
 /** Apply keyboard state to FlightDynamics rates and throttle before physics step. */
 function applyKeyInputs(dt: number): void {
-  // --- Pitch: W = nose up (negative pitch rate), S = nose down ---
-  if (keys['KeyW']) {
+  // --- Pitch: S = nose up (negative pitch rate), W = nose down ---
+  if (keys['KeyS']) {
     flight.pitchRate -= PITCH_ACCEL * dt;
-  } else if (keys['KeyS']) {
+  } else if (keys['KeyW']) {
     flight.pitchRate += PITCH_ACCEL * dt;
   } else {
     flight.pitchRate *= RATE_DECAY;
@@ -311,8 +313,8 @@ function applyKeyInputs(dt: number): void {
  * the same screen edge the triangle is discarded (conservative, no clipping).
  */
 
-const TERRAIN_GRID_HALF = 80;        // cells in each direction — 80×80 total
-const TERRAIN_CELL_SIZE = 6000;      // ×20 wider — massive world scale
+const TERRAIN_GRID_HALF = 25;        // cells in each direction — fog hides the horizon cutoff
+const TERRAIN_CELL_SIZE = 4500;      // world units per terrain cell
 
 function terrainHeight(wx: number, wz: number): number {
   // Rolling hills — frequencies scaled to match new cell size, amplitudes ×20
@@ -340,7 +342,7 @@ interface FaceEntry {
   kind: 0 | 1 | 2;
 }
 
-const MAX_FACES = 30000;
+const MAX_FACES = 20_000;   // 25×25×2 terrain + sparse trees + jet fits comfortably
 const facePool: FaceEntry[] = [];
 for (let i = 0; i < MAX_FACES; i++) {
   facePool.push({
@@ -480,9 +482,9 @@ Promise.all([
 // Procedural forest scatter
 // ---------------------------------------------------------------------------
 
-const GROUND_Y        = -100000;  // ×20 deeper — matches new terrain scale
-const TREE_GRID_HALF  = 6;        // sparse grid cells either side of camera
-const TREE_CELL_SIZE  = TERRAIN_CELL_SIZE * 2;   // one tree per 2 terrain cells
+const GROUND_Y        = -100000;  // ×20 deeper — matches terrain scale
+const TREE_GRID_HALF  = 8;        // matches reduced terrain draw distance
+const TREE_CELL_SIZE  = TERRAIN_CELL_SIZE;   // exactly one cell = one terrain vertex spacing
 const TREE_SCALE      = 160;      // ×20 larger — proportional to terrain
 
 /**
@@ -498,7 +500,12 @@ function cellRand(ix: number, iz: number): number {
 
 /**
  * Push instanced tree faces into facePool for visible trees near the camera.
- * Each tree sits exactly on the terrain sine-wave surface.
+ *
+ * Trees are placed exclusively on exact terrain grid vertex positions —
+ * i.e. integer multiples of TERRAIN_CELL_SIZE — so their root XZ coordinates
+ * are identical to the triangle corner vertices.  terrainHeight() evaluated at
+ * those same integer coords gives the exact corner height, guaranteeing the
+ * tree base perfectly anchors to the terrain surface with no floating error.
  */
 function pushTreeFaces(startIdx: number, camWX: number, camWZ: number): number {
   if (!treeData) return startIdx;
@@ -506,29 +513,24 @@ function pushTreeFaces(startIdx: number, camWX: number, camWZ: number): number {
   const { vertices, indices } = treeData;
   const camWY = flight.posY;
 
-  // Snap camera to tree-grid so the forest is stable
-  const gridOriginX = Math.round(camWX / TREE_CELL_SIZE) * TREE_CELL_SIZE;
-  const gridOriginZ = Math.round(camWZ / TREE_CELL_SIZE) * TREE_CELL_SIZE;
+  // Snap camera position to the nearest terrain vertex so the grid is stable
+  const originX = Math.round(camWX / TREE_CELL_SIZE) * TREE_CELL_SIZE;
+  const originZ = Math.round(camWZ / TREE_CELL_SIZE) * TREE_CELL_SIZE;
 
   for (let gz = -TREE_GRID_HALF; gz <= TREE_GRID_HALF; gz++) {
     for (let gx = -TREE_GRID_HALF; gx <= TREE_GRID_HALF; gx++) {
-      const cellX = gridOriginX + gx * TREE_CELL_SIZE;
-      const cellZ = gridOriginZ + gz * TREE_CELL_SIZE;
+      // wx / wz are exact integer multiples of TERRAIN_CELL_SIZE — terrain vertex coords
+      const wx = originX + gx * TREE_CELL_SIZE;
+      const wz = originZ + gz * TREE_CELL_SIZE;
 
-      // Skip ~70% of cells so the forest is sparse
-      if (cellRand(cellX, cellZ) > 0.30) continue;
+      // Skip ~70 % of vertices so the forest is naturally sparse
+      if (cellRand(wx, wz) > 0.30) continue;
 
-      // Jitter within the cell using a second hash value
-      const jitter = TREE_CELL_SIZE * 0.4;
-      const wx = cellX + (cellRand(cellX + 1, cellZ)     - 0.5) * jitter;
-      const wz = cellZ + (cellRand(cellX,     cellZ + 1) - 0.5) * jitter;
-
-      // Tree base Y = terrain height at this XZ position
+      // Height sampled at the exact vertex position — matches terrain triangle corner
       const wy = GROUND_Y + terrainHeight(wx, wz);
 
       // Transform a single tree vertex to view space
       function treeToView(vx: number, vy: number, vz: number): [number, number, number] {
-        // Scale model, offset to world position, then camera transform
         const wx2 = wx + vx * TREE_SCALE;
         const wy2 = wy + vy * TREE_SCALE;
         const wz2 = wz + vz * TREE_SCALE;
@@ -567,6 +569,22 @@ function pushTreeFaces(startIdx: number, camWX: number, camWZ: number): number {
   }
   return idx;
 }
+
+// ---------------------------------------------------------------------------
+// Distance fog
+// ---------------------------------------------------------------------------
+
+/**
+ * Fog is applied in PASS 3 by lerping each polygon's lit colour toward the
+ * background sky colour based on the face's view-space avgZ depth.
+ * FOG_START / FOG_END are in view-space Z units (same scale as avgZ).
+ * The background colour rgb(5,5,16) must match the ctx.fillStyle clear colour.
+ */
+const FOG_START  = 10;   // view-Z at which fog begins (close — matches tight Z_OFFSET)
+const FOG_END    = 120;  // view-Z at which fog reaches 100% — geometry fully hidden
+const FOG_R      = 5;    // background sky colour R (matches '#050510')
+const FOG_G      = 5;    // background sky colour G
+const FOG_B      = 16;   // background sky colour B
 
 // ---------------------------------------------------------------------------
 // Render loop
@@ -613,10 +631,10 @@ function tick(ts: DOMHighResTimeStamp): void {
       const i1 = indices[i + 1] * 3;
       const i2 = indices[i + 2] * 3;
 
-      // Step 1 — apply jet's own flight orientation (body → world)
-      let [bx0, by0, bz0] = rotateEuler(vertices[i0], vertices[i0+1], vertices[i0+2], flight.yaw, flight.pitch, flight.roll);
-      let [bx1, by1, bz1] = rotateEuler(vertices[i1], vertices[i1+1], vertices[i1+2], flight.yaw, flight.pitch, flight.roll);
-      let [bx2, by2, bz2] = rotateEuler(vertices[i2], vertices[i2+1], vertices[i2+2], flight.yaw, flight.pitch, flight.roll);
+      // Step 1 — scale jet vertices to keep proportions at low Z_OFFSET, then apply flight orientation
+      let [bx0, by0, bz0] = rotateEuler(vertices[i0]*JET_VERTEX_SCALE, vertices[i0+1]*JET_VERTEX_SCALE, vertices[i0+2]*JET_VERTEX_SCALE, flight.yaw, flight.pitch, flight.roll);
+      let [bx1, by1, bz1] = rotateEuler(vertices[i1]*JET_VERTEX_SCALE, vertices[i1+1]*JET_VERTEX_SCALE, vertices[i1+2]*JET_VERTEX_SCALE, flight.yaw, flight.pitch, flight.roll);
+      let [bx2, by2, bz2] = rotateEuler(vertices[i2]*JET_VERTEX_SCALE, vertices[i2+1]*JET_VERTEX_SCALE, vertices[i2+2]*JET_VERTEX_SCALE, flight.yaw, flight.pitch, flight.roll);
 
       // Step 2 — apply camera orbit (mouse rotation) on top
       let [x0, y0, z0] = rotateX(...rotateY(bx0, by0, bz0, rotAngleY), rotAngleX);
@@ -650,18 +668,33 @@ function tick(ts: DOMHighResTimeStamp): void {
   visibleFaces.sort((a, b) => b.avgZ - a.avgZ);
 
   // -----------------------------------------------------------------------
-  // PASS 3 — draw with PS1-snapped vertices
+  // PASS 3 — draw with PS1-snapped vertices + distance fog
   // -----------------------------------------------------------------------
   for (let f = 0; f < visibleFaces.length; f++) {
-    const { x0, y0, z0, x1, y1, z1, x2, y2, z2, brightness, baseR, baseG, baseB } = visibleFaces[f];
+    const face = visibleFaces[f];
+    const { x0, y0, z0, x1, y1, z1, x2, y2, z2, brightness, baseR, baseG, baseB, avgZ, kind } = face;
 
     const [sx0, sy0] = projectSnapped(x0, y0, z0);
     const [sx1, sy1] = projectSnapped(x1, y1, z1);
     const [sx2, sy2] = projectSnapped(x2, y2, z2);
 
-    const r = Math.round(brightness * baseR);
-    const g = Math.round(brightness * baseG);
-    const b = Math.round(brightness * baseB);
+    // Lit colour before fog
+    let lr = brightness * baseR;
+    let lg = brightness * baseG;
+    let lb = brightness * baseB;
+
+    // Distance fog — lerp lit colour toward sky background based on view-Z depth.
+    // Jet faces (kind 0) are always near z≈0 so skip fog for them.
+    if (kind !== 0) {
+      const fogT = Math.max(0, Math.min(1, (avgZ - FOG_START) / (FOG_END - FOG_START)));
+      lr = lr + (FOG_R - lr) * fogT;
+      lg = lg + (FOG_G - lg) * fogT;
+      lb = lb + (FOG_B - lb) * fogT;
+    }
+
+    const r = Math.round(lr);
+    const g = Math.round(lg);
+    const b = Math.round(lb);
 
     ctx!.fillStyle   = `rgb(${r},${g},${b})`;
     ctx!.strokeStyle = `rgb(${r},${g},${b})`;
