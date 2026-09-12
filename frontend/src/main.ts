@@ -317,12 +317,12 @@ const TERRAIN_GRID_HALF = 25;        // cells in each direction — fog hides th
 const TERRAIN_CELL_SIZE = 4500;      // world units per terrain cell
 
 function terrainHeight(wx: number, wz: number): number {
-  // Rolling hills — frequencies scaled to match new cell size, amplitudes ×20
+  // Rolling hills — amplitudes scaled to world units that are visible at GROUND_Y = -80
   return (
-    Math.sin(wx * 0.000090) * 5000 +
-    Math.sin(wz * 0.000065) * 4000 +
-    Math.sin((wx + wz) * 0.000045) * 2400 +
-    Math.sin(wx * 0.000175 - wz * 0.000110) * 1200
+    Math.sin(wx * 0.000090) * 30 +
+    Math.sin(wz * 0.000065) * 20 +
+    Math.sin((wx + wz) * 0.000045) * 12 +
+    Math.sin(wx * 0.000175 - wz * 0.000110) * 6
   );
 }
 
@@ -408,8 +408,8 @@ function pushTerrainFaces(startIdx: number, camWX: number, camWZ: number): numbe
     return [v[0] + panX, v[1] + panY, v[2]];
   }
 
-  // Terrain base colour (lit green)
-  const TR = 40, TG = 110, TB = 40;
+  // Terrain base colour — vivid green so it reads clearly before fog darkens it
+  const TR = 50, TG = 200, TB = 50;
 
   for (let gz = -TERRAIN_GRID_HALF; gz < TERRAIN_GRID_HALF; gz++) {
     for (let gx = -TERRAIN_GRID_HALF; gx < TERRAIN_GRID_HALF; gx++) {
@@ -482,10 +482,10 @@ Promise.all([
 // Procedural forest scatter
 // ---------------------------------------------------------------------------
 
-const GROUND_Y        = -100000;  // ×20 deeper — matches terrain scale
-const TREE_GRID_HALF  = 8;        // matches reduced terrain draw distance
-const TREE_CELL_SIZE  = TERRAIN_CELL_SIZE;   // exactly one cell = one terrain vertex spacing
-const TREE_SCALE      = 160;      // ×20 larger — proportional to terrain
+const GROUND_Y        = -80;          // world-Y of terrain base — 1 view-unit below jet origin
+const TREE_GRID_HALF  = 8;            // matches reduced terrain draw distance
+const TREE_CELL_SIZE  = TERRAIN_CELL_SIZE;   // one tree per terrain vertex
+const TREE_SCALE      = 1.5;          // world units — scaled to match new terrain amplitude
 
 /**
  * Deterministic pseudo-random [0,1) from two integers.
@@ -575,16 +575,17 @@ function pushTreeFaces(startIdx: number, camWX: number, camWZ: number): number {
 // ---------------------------------------------------------------------------
 
 /**
- * Fog is applied in PASS 3 by lerping each polygon's lit colour toward the
- * background sky colour based on the face's view-space avgZ depth.
- * FOG_START / FOG_END are in view-space Z units (same scale as avgZ).
- * The background colour rgb(5,5,16) must match the ctx.fillStyle clear colour.
+ * MAX_DRAW_DISTANCE is the view-space Z depth of the terrain grid edge —
+ * the furthest point any terrain vertex can be from the camera.
+ *
+ * Fog lerps geometry colours toward the background as depth approaches this
+ * value, hiding the hard grid cutoff.  Jet faces (kind 0) are exempt.
  */
-const FOG_START  = 10;   // view-Z at which fog begins (close — matches tight Z_OFFSET)
-const FOG_END    = 120;  // view-Z at which fog reaches 100% — geometry fully hidden
-const FOG_R      = 5;    // background sky colour R (matches '#050510')
-const FOG_G      = 5;    // background sky colour G
-const FOG_B      = 16;   // background sky colour B
+const MAX_DRAW_DISTANCE = (TERRAIN_GRID_HALF * TERRAIN_CELL_SIZE) / MODEL_SCALE;
+const FOG_NEAR_FRAC     = 0.2;   // fog begins at this fraction of MAX_DRAW_DISTANCE
+const FOG_R             = 5;     // background sky colour R (matches '#050510')
+const FOG_G             = 5;     // background sky colour G
+const FOG_B             = 16;    // background sky colour B
 
 // ---------------------------------------------------------------------------
 // Render loop
@@ -684,9 +685,11 @@ function tick(ts: DOMHighResTimeStamp): void {
     let lb = brightness * baseB;
 
     // Distance fog — lerp lit colour toward sky background based on view-Z depth.
-    // Jet faces (kind 0) are always near z≈0 so skip fog for them.
+    // fogT goes 0→1 between (FOG_NEAR_FRAC * MAX_DRAW_DISTANCE) and MAX_DRAW_DISTANCE.
+    // Jet faces (kind 0) are always near z≈0, so fog is skipped for them.
     if (kind !== 0) {
-      const fogT = Math.max(0, Math.min(1, (avgZ - FOG_START) / (FOG_END - FOG_START)));
+      const fogNear = FOG_NEAR_FRAC * MAX_DRAW_DISTANCE;
+      const fogT    = Math.max(0, Math.min(1, (avgZ - fogNear) / (MAX_DRAW_DISTANCE - fogNear)));
       lr = lr + (FOG_R - lr) * fogT;
       lg = lg + (FOG_G - lg) * fogT;
       lb = lb + (FOG_B - lb) * fogT;
