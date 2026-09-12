@@ -53,7 +53,7 @@ let lastMouseY       = 0;
 
 const ROT_SENSITIVITY  = 0.005;
 const PAN_SENSITIVITY  = 0.015;
-const ZOOM_SENSITIVITY = 50;    // Z_OFFSET units per normalised wheel delta (~100 per notch)
+const ZOOM_SENSITIVITY = 10;    // Z_OFFSET units per normalised wheel delta (~100 per notch)
 
 canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 
@@ -317,12 +317,13 @@ const TERRAIN_GRID_HALF = 25;        // cells in each direction — fog hides th
 const TERRAIN_CELL_SIZE = 4500;      // world units per terrain cell
 
 function terrainHeight(wx: number, wz: number): number {
-  // Rolling hills — amplitudes scaled to world units that are visible at GROUND_Y = -80
+  // Multi-octave rolling hills.  Max combined amplitude ≈ ±25 world units,
+  // well within GROUND_Y = -80 so peaks stay in-view from above.
   return (
-    Math.sin(wx * 0.000090) * 30 +
-    Math.sin(wz * 0.000065) * 20 +
-    Math.sin((wx + wz) * 0.000045) * 12 +
-    Math.sin(wx * 0.000175 - wz * 0.000110) * 6
+    Math.sin(wx * 0.000090) * 25 +
+    Math.sin(wz * 0.000065) * 18 +
+    Math.sin((wx + wz) * 0.000045) * 10 +
+    Math.sin(wx * 0.000175 - wz * 0.000110) * 5
   );
 }
 
@@ -408,8 +409,9 @@ function pushTerrainFaces(startIdx: number, camWX: number, camWZ: number): numbe
     return [v[0] + panX, v[1] + panY, v[2]];
   }
 
-  // Terrain base colour — vivid green so it reads clearly before fog darkens it
-  const TR = 50, TG = 200, TB = 50;
+  // Terrain base colour — dark forest green; brightness clamped so near faces don't blow out
+  const TR = 30, TG = 140, TB = 30;
+  const BR_MIN = 0.35, BR_MAX = 0.75;   // diffuse range: dim shadows → muted highlights
 
   for (let gz = -TERRAIN_GRID_HALF; gz < TERRAIN_GRID_HALF; gz++) {
     for (let gx = -TERRAIN_GRID_HALF; gx < TERRAIN_GRID_HALF; gx++) {
@@ -437,7 +439,7 @@ function pushTerrainFaces(startIdx: number, camWX: number, camWZ: number): numbe
         // Force normal to point upward in view space (ny > 0 after camera rot)
         if (cny < 0) { cnx = -cnx; cny = -cny; cnz = -cnz; }
         const [nx, ny, nz] = normaliseV3(cnx, cny, cnz);
-        const br = 0.45 + 0.55 * Math.max(0, dotV3(nx, ny, nz, LIGHT[0], LIGHT[1], LIGHT[2]));
+        const br = Math.min(BR_MAX, BR_MIN + (BR_MAX - BR_MIN) * Math.max(0, dotV3(nx, ny, nz, LIGHT[0], LIGHT[1], LIGHT[2])));
         const e  = facePool[idx++];
         e.x0=ax; e.y0=ay; e.z0=az; e.x1=bx; e.y1=by; e.z1=bz; e.x2=cx; e.y2=cy; e.z2=cz;
         e.avgZ = (az+bz+cz)/3; e.brightness = br;
@@ -449,7 +451,7 @@ function pushTerrainFaces(startIdx: number, camWX: number, camWZ: number): numbe
         let [cnx, cny, cnz] = crossV3(dx-bx, dy-by, dz-bz, cx-bx, cy-by, cz-bz);
         if (cny < 0) { cnx = -cnx; cny = -cny; cnz = -cnz; }
         const [nx, ny, nz] = normaliseV3(cnx, cny, cnz);
-        const br = 0.45 + 0.55 * Math.max(0, dotV3(nx, ny, nz, LIGHT[0], LIGHT[1], LIGHT[2]));
+        const br = Math.min(BR_MAX, BR_MIN + (BR_MAX - BR_MIN) * Math.max(0, dotV3(nx, ny, nz, LIGHT[0], LIGHT[1], LIGHT[2])));
         const e  = facePool[idx++];
         e.x0=bx; e.y0=by; e.z0=bz; e.x1=dx; e.y1=dy; e.z1=dz; e.x2=cx; e.y2=cy; e.z2=cz;
         e.avgZ = (bz+dz+cz)/3; e.brightness = br;
